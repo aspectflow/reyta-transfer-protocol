@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96"
+          components: clippy, rustfmt
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prototype/native/rtp2-core
+
+      - name: cargo fmt
+        working-directory: prototype/native/rtp2-core
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        working-directory: prototype/native/rtp2-core
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: prototype/native/rtp2-core
+        run: cargo test --release
+
+      - name: build native library
+        working-directory: prototype
+        run: make native
+
+      - name: go vet
+        working-directory: prototype
+        run: go vet ./...
+
+      - name: go test
+        working-directory: prototype
+        env:
+          CGO_ENABLED: '1'
+        run: go test -count=1 ./...
+
+      - name: build without cgo
+        working-directory: prototype
+        env:
+          CGO_ENABLED: '0'
+        run: go build ./...
+
+  mutation:
+    name: mutation check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prototype/native/rtp2-core
+      - name: mutation check
+        working-directory: prototype/native/rtp2-core
+        run: JOBS=3 ./mutation-check.sh

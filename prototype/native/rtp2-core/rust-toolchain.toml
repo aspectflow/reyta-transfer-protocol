@@ -1,0 +1,12 @@
+# Copyright 2026 The Reyta Labs Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+# Pinned so a clone builds the same way this was tested, rather than relying on
+# a `rustup override` that exists only on one machine.
+#
+# 1.96 is what the suite and the mutation check were run against. The crate
+# itself declares `rust-version = "1.91"`, which is the floor it is known to
+# compile on; edition 2024 puts the hard minimum at 1.85.
+[toolchain]
+channel = "1.96"
+components = ["clippy", "rustfmt"]

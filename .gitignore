@@ -1,0 +1,24 @@
+# Rust build output. 5 GB of it; never in git.
+target/
+**/target/
+
+# Go
+*.received
+*.test
+
+# Local benchmark and demo artefacts
+*.bin
+!testdata/**/*.bin
+
+# macOS
+.DS_Store
+
+# Internal working documents. Not published.
+audit/
+PLAN.md
+ROADMAP.md
+RTP-2.0-SPEC.md
+bin/
+
+# Wire schema. Ships with the specification, not with the prototype.
+rtp2.cddl

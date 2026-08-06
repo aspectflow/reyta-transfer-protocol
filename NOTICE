@@ -1,0 +1,9 @@
+Reyta Transfer Protocol 2.0
+Copyright 2026 The Reyta Labs Authors
+
+This product includes software developed at Reyta Labs.
+
+The Rust core links libcrux for ML-KEM-768 and ML-DSA-65, iroh for the QUIC
+transport, and the RustCrypto implementations of XChaCha20-Poly1305, X25519 and
+Ed25519. Their licenses are recorded in prototype/native/rtp2-core/Cargo.lock
+and in the respective upstream distributions.
