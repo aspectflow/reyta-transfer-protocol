@@ -95,15 +95,15 @@ sequenceDiagram
 
     Note over S,R: QUIC, ALPN reyta-transfer/2
     R-->>S: endpoint address, carried out of band
-    Note over S: the path is classified and checked<br/>against policy before any byte is sent
+    Note over S: chunk, encrypt each chunk,<br/>BLAKE3 Merkle root over the ciphertext
+    Note over S: the QUIC path is classified and checked against<br/>policy before any protocol byte is sent
 
     S->>R: ClientHello   version, suites, nonce, X25519 and ML-KEM-768 keys, cert
-    R->>S: ServerHello   ML-KEM ciphertext, cert, Ed25519 and ML-DSA-65 signature
+    R->>S: ServerHello   its own ephemeral keys, ML-KEM ciphertext, cert,<br/>Ed25519 and ML-DSA-65 signature
     S->>R: ClientFinish  ML-KEM ciphertext, signature, finished MAC
     R->>S: ServerFinish  finished MAC
     Note over S,R: one X25519 and two ML-KEM-768 secrets,<br/>combined through HKDF-SHA-384
 
-    Note over S: chunk, encrypt each chunk,<br/>BLAKE3 Merkle root over the ciphertext
     S->>R: TransferOffer  manifests, one key envelope per device, signature
     Note over R: verify the signature and the commitment,<br/>open the envelope to get the file key
 
