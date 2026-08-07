@@ -12,8 +12,8 @@ package rtp2
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../native/rtp2-core/include
-#cgo linux LDFLAGS: -L${SRCDIR}/../native/rtp2-core/target/release -lrtp2_core -ldl -lpthread -lm
-#cgo darwin LDFLAGS: -L${SRCDIR}/../native/rtp2-core/target/release -lrtp2_core -framework Security -framework SystemConfiguration -framework CoreFoundation -framework CoreWLAN
+#cgo linux LDFLAGS: -L${SRCDIR}/../native/rtp2-core/target/release -Wl,-rpath,${SRCDIR}/../native/rtp2-core/target/release -lrtp2_core -ldl -lpthread -lm
+#cgo darwin LDFLAGS: -L${SRCDIR}/../native/rtp2-core/target/release -Wl,-rpath,${SRCDIR}/../native/rtp2-core/target/release -lrtp2_core -framework Security -framework SystemConfiguration -framework CoreFoundation -framework CoreWLAN
 #include <stdlib.h>
 #include "rtp2.h"
 */
