@@ -58,27 +58,20 @@ address blobs, transfer reports, digests.
   +---------------------------------v--------------------------------+
   |  rtp2-core (Rust)                                                 |
   |                                                                   |
-  |   handshake      X25519 + ML-KEM-768, SHA-384 transcript,         |
-  |                  Ed25519 + ML-DSA-65 device signatures            |
-  |                                                                   |
-  |   keys           file_prk -> chunk keys, deterministic nonces,    |
-  |                  sealed key envelope per recipient device         |
-  |                                                                   |
-  |   object         XChaCha20-Poly1305 per chunk, AAD binds the      |
-  |                  object context and the chunk index               |
-  |                                                                   |
-  |   merkle         BLAKE3 commitment over ciphertext, inclusion     |
-  |                  proofs bound to leaf position                    |
-  |                                                                   |
-  |   manifest       public and private manifests, RTP-CBOR,          |
-  |                  manifest commitment signed in the offer          |
-  |                                                                   |
-  |   resume         verified and durable ranges, crash consistent    |
-  |   store          device identity sealed under the platform        |
-  |                  keystore, or under a Secure Enclave key          |
-  |   route          observed path class, and a policy that can       |
-  |                  refuse one before the first byte is sent         |
-  |   events         bounded queue, polled across the ABI             |
+  |   handshake      mutual device authentication, session keys       |
+  |   keys           per-file key hierarchy, one sealed envelope      |
+  |                  per recipient device                             |
+  |   object         chunking, and authenticated encryption bound     |
+  |                  to the object and the chunk index                |
+  |   merkle         commitment over ciphertext, per-chunk proofs     |
+  |                  bound to leaf position                           |
+  |   manifest       what a relay may read, and what only the         |
+  |                  recipient may                                    |
+  |   resume         which chunks are verified, which are durable     |
+  |   store          device identity at rest, sealed or not           |
+  |   route          the observed path, and the policy that can       |
+  |                  refuse it before the first byte is sent          |
+  |   events         bounded progress queue, polled across the ABI    |
   +---------------------------------+--------------------------------+
                                     |
   +---------------------------------v--------------------------------+
@@ -89,6 +82,46 @@ address blobs, transfer reports, digests.
 Pinned dependencies for the cryptography: BLAKE3 1.8.3, libcrux 0.0.10 for
 ML-KEM-768 and ML-DSA-65 (FIPS 203 and 204), x25519-dalek, ed25519-dalek, and
 XChaCha20-Poly1305 with HKDF and HMAC over SHA-384.
+
+### A transfer, in order
+
+The diagram above is what the parts are. This is what they do, and when.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Sender
+    participant R as Receiver
+
+    Note over S,R: QUIC, ALPN reyta-transfer/2
+    R-->>S: endpoint address, carried out of band
+    Note over S: the path is classified and checked<br/>against policy before any byte is sent
+
+    S->>R: ClientHello   version, suites, nonce, X25519 and ML-KEM-768 keys, cert
+    R->>S: ServerHello   ML-KEM ciphertext, cert, Ed25519 and ML-DSA-65 signature
+    S->>R: ClientFinish  ML-KEM ciphertext, signature, finished MAC
+    R->>S: ServerFinish  finished MAC
+    Note over S,R: one X25519 and two ML-KEM-768 secrets,<br/>combined through HKDF-SHA-384
+
+    Note over S: chunk, encrypt each chunk,<br/>BLAKE3 Merkle root over the ciphertext
+    S->>R: TransferOffer  manifests, one key envelope per device, signature
+    Note over R: verify the signature and the commitment,<br/>open the envelope to get the file key
+
+    R->>S: RangeRequest  only the chunks still missing
+    loop once per chunk
+        S->>R: ChunkRecord  ciphertext and its inclusion proof
+        Note over R: proof, then AEAD, then length,<br/>then write, then mark durable
+    end
+    S->>R: StreamEnd
+    R->>S: Complete  the plaintext digest the receiver verified
+
+    Note over S: delivery is claimed only here
+```
+
+Everything after ServerFinish is encrypted under the derived control keys and
+carries an epoch and a counter, so no frame can be replayed or reordered. The
+address in the first line is not a protocol message: it is a string the two
+sides exchange however they like.
 
 ## What works
 
