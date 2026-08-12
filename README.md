@@ -48,34 +48,34 @@ address blobs, transfer reports, digests.
 
 ```
   +------------------------------------------------------------------+
-  |  application layer            Go, Swift or C++                    |
-  |                               product state, UI, policy input     |
+  |  application layer            Go, Swift or C++                   |
+  |                               product state, UI, policy input    |
   +---------------------------------+--------------------------------+
                                     |
                        C ABI v6     |  handles, paths, CBOR blobs
                        no key material crosses this line
                                     |
   +---------------------------------v--------------------------------+
-  |  rtp2-core (Rust)                                                 |
-  |                                                                   |
-  |   handshake      mutual device authentication, session keys       |
-  |   keys           per-file key hierarchy, one sealed envelope      |
-  |                  per recipient device                             |
-  |   object         chunking, and authenticated encryption bound     |
-  |                  to the object and the chunk index                |
-  |   merkle         commitment over ciphertext, per-chunk proofs     |
-  |                  bound to leaf position                           |
-  |   manifest       what a relay may read, and what only the         |
-  |                  recipient may                                    |
-  |   resume         which chunks are verified, which are durable     |
-  |   store          device identity at rest, sealed or not           |
-  |   route          the observed path, and the policy that can       |
-  |                  refuse it before the first byte is sent          |
-  |   events         bounded progress queue, polled across the ABI    |
+  |  rtp2-core (Rust)                                                |
+  |                                                                  |
+  |   handshake      mutual device authentication, session keys      |
+  |   keys           per-file key hierarchy, one sealed envelope     |
+  |                  per recipient device                            |
+  |   object         chunking, and authenticated encryption bound    |
+  |                  to the object and the chunk index               |
+  |   merkle         commitment over ciphertext, per-chunk proofs    |
+  |                  bound to leaf position                          |
+  |   manifest       what a relay may read, and what only the        |
+  |                  recipient may                                   |
+  |   resume         which chunks are verified, which are durable    |
+  |   store          device identity at rest, sealed or not          |
+  |   route          the observed path, and the policy that can      |
+  |                  refuse it before the first byte is sent         |
+  |   events         bounded progress queue, polled across the ABI   |
   +---------------------------------+--------------------------------+
                                     |
   +---------------------------------v--------------------------------+
-  |  transport       Iroh 1.0.3, QUIC, ALPN reyta-transfer/2          |
+  |  transport       Iroh 1.0.3, QUIC, ALPN reyta-transfer/2         |
   +------------------------------------------------------------------+
 ```
 
