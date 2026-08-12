@@ -95,27 +95,28 @@ sequenceDiagram
 
     Note over S,R: QUIC, ALPN reyta-transfer/2
     R-->>S: endpoint address, carried out of band
-    Note over S: chunk, encrypt each chunk,<br/>BLAKE3 Merkle root over the ciphertext
-    Note over S: the QUIC path is classified and checked against<br/>policy before any protocol byte is sent
 
-    S->>R: ClientHello   version, suites, nonce, X25519 and ML-KEM-768 keys, cert
-    R->>S: ServerHello   its own ephemeral keys, ML-KEM ciphertext, cert,<br/>Ed25519 and ML-DSA-65 signature
-    S->>R: ClientFinish  ML-KEM ciphertext, signature, finished MAC
-    R->>S: ServerFinish  finished MAC
-    Note over S,R: one X25519 and two ML-KEM-768 secrets,<br/>combined through HKDF-SHA-384
+    Note right of S: chunk, encrypt, take the BLAKE3 Merkle root
+    Note right of S: classify the QUIC path, check policy first
 
-    S->>R: TransferOffer  manifests, one key envelope per device, signature
-    Note over R: verify the signature and the commitment,<br/>open the envelope to get the file key
+    S->>R: ClientHello — version, suites, nonce, X25519 and ML-KEM-768 keys, cert
+    R->>S: ServerHello — ephemeral keys, ML-KEM ciphertext, cert, hybrid signature
+    S->>R: ClientFinish — ML-KEM ciphertext, signature, finished MAC
+    R->>S: ServerFinish — finished MAC
+    Note over S,R: one X25519 and two ML-KEM-768 secrets, combined through HKDF-SHA-384
 
-    R->>S: RangeRequest  only the chunks still missing
+    S->>R: TransferOffer — manifests, one key envelope per device, signature
+    Note left of R: verify signature and commitment, open the envelope
+
+    R->>S: RangeRequest — only the chunks still missing
     loop once per chunk
-        S->>R: ChunkRecord  ciphertext and its inclusion proof
-        Note over R: proof, then AEAD, then length,<br/>then write, then mark durable
+        S->>R: ChunkRecord — ciphertext and its inclusion proof
+        Note left of R: proof, AEAD, length, write, mark durable
     end
-    S->>R: StreamEnd
-    R->>S: Complete  the plaintext digest the receiver verified
 
-    Note over S: delivery is claimed only here
+    S->>R: StreamEnd
+    R->>S: Complete — the plaintext digest the receiver verified
+    Note right of S: delivery is claimed only here
 ```
 
 Everything after ServerFinish is encrypted under the derived control keys and
