@@ -357,13 +357,16 @@ impl Scheduler {
 
     /// Everything missing in one request, for a route switch where the new
     /// provider needs the whole picture (§18.5).
-    pub fn full_request(&self, have: &ChunkBitmap) -> Option<RangeRequest> {
+    ///
+    /// A request with no ranges is a real answer, not an absent one: it is
+    /// what an object that is already complete asks for, and it is valid on
+    /// the wire. Returning `None` for that case made the one caller invent an
+    /// empty request by hand, magic priority class and all, which is the
+    /// scheduler's own encoding written out a second time by someone else.
+    pub fn full_request(&self, have: &ChunkBitmap) -> RangeRequest {
         let ranges = have.missing_ranges(MAX_RANGES_PER_REQUEST);
-        if ranges.is_empty() {
-            return None;
-        }
         let total: u64 = ranges.iter().map(|(s, e)| e - s).sum();
-        Some(RangeRequest {
+        RangeRequest {
             transfer_id: self.transfer_id,
             object_id: self.object_id,
             priority_class: Priority::Sequential as u64,
@@ -371,7 +374,7 @@ impl Scheduler {
             max_bytes: total.saturating_mul(self.chunk_ciphertext_size),
             preferred_chunk_order: self.order as u64,
             durable_ack_generation: self.generation,
-        })
+        }
     }
 
     pub fn chunk_count(&self) -> u64 {
@@ -496,7 +499,7 @@ mod tests {
             have.set(i).unwrap();
         }
         let s = scheduler(8000);
-        let req = s.full_request(&have).unwrap();
+        let req = s.full_request(&have);
         assert!(req.ranges.len() <= MAX_RANGES_PER_REQUEST);
         req.validate(8000).unwrap();
 
@@ -562,7 +565,7 @@ mod tests {
         for i in [0u64, 1, 10, 11, 30] {
             have.set(i).unwrap();
         }
-        let req = s.full_request(&have).unwrap();
+        let req = s.full_request(&have);
         let bytes = req.encode();
         assert_eq!(RangeRequest::decode(&bytes, 50).unwrap(), req);
 
