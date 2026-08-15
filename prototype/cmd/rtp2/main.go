@@ -16,6 +16,7 @@
 //	-state <dir>    persist this device's identity across restarts
 //	-keystore       seal the identity under the platform keystore
 //	-route <p>      any | direct | loopback
+//	-route-grace <d> how long holepunching gets, e.g. 45s (0 = default)
 //	-timeout <d>    how long recv waits for a peer
 //	-resume <file>  keep resume state so an interrupted recv continues
 //
@@ -42,9 +43,13 @@ var (
 	stateDir = flag.String("state", "", "directory holding a persistent device identity")
 	keystore = flag.Bool("keystore", false, "seal the identity under the platform keystore")
 	route    = flag.String("route", "any", "acceptable network path: any, direct or loopback")
-	timeout  = flag.Duration("timeout", 10*time.Minute, "how long recv waits for a peer")
-	resume   = flag.String("resume", "", "keep resume state here so an interrupted recv continues")
-	quiet    = flag.Bool("quiet", false, "suppress progress output")
+	// Holepunching is not instant, so -route direct has to wait before it can
+	// honestly refuse. How long is a judgement about this network, which the
+	// person running the transfer is in a better position to make than we are.
+	routeGrace = flag.Duration("route-grace", 0, "how long holepunching gets to produce an acceptable path (0 = built-in default)")
+	timeout    = flag.Duration("timeout", 10*time.Minute, "how long recv waits for a peer")
+	resume     = flag.String("resume", "", "keep resume state here so an interrupted recv continues")
+	quiet      = flag.Bool("quiet", false, "suppress progress output")
 )
 
 func main() {
@@ -99,7 +104,13 @@ func options(suffix string) rtp2.RuntimeOptions {
 	if dir != "" && suffix != "" {
 		dir = filepath.Join(dir, suffix)
 	}
-	opts := rtp2.RuntimeOptions{StateDir: dir}
+	// Checked before it reaches the wrapper, which reads any non-positive
+	// period as "use the default" — silently turning a typo into a setting the
+	// caller did not choose.
+	if *routeGrace < 0 {
+		log.Fatalf("-route-grace %s is negative", *routeGrace)
+	}
+	opts := rtp2.RuntimeOptions{StateDir: dir, RouteGrace: *routeGrace}
 
 	if *keystore {
 		if *stateDir == "" {
@@ -120,6 +131,15 @@ func options(suffix string) rtp2.RuntimeOptions {
 		log.Fatalf("unknown -route %q: use any, direct or loopback", *route)
 	}
 	return opts
+}
+
+// graceDescription names the deadline a refusal was measured against,
+// including when the flag was left alone and the core chose.
+func graceDescription() string {
+	if *routeGrace <= 0 {
+		return "the default grace period"
+	}
+	return routeGrace.String()
 }
 
 func start(suffix string) (*rtp2.Runtime, *rtp2.Endpoint) {
@@ -266,7 +286,15 @@ func watchEvents(runtime *rtp2.Runtime) chan struct{} {
 				continue
 			}
 			if line := describeEvent(e); line != "" {
-				fmt.Fprintf(os.Stderr, "\r%-70s", line)
+				// Progress is transient and overwrites itself in place.
+				// Everything else records something that happened — a route
+				// switching mid-transfer above all — and has to survive the
+				// next progress tick, or the run leaves no trace of it.
+				if e.Type == rtp2.EventTransferProgress {
+					fmt.Fprintf(os.Stderr, "\r%-70s", line)
+					continue
+				}
+				fmt.Fprintf(os.Stderr, "\r%-70s\n", line)
 			}
 		}
 	}()
@@ -320,8 +348,15 @@ func routeName(e *rtp2.Event) string {
 		return "direct, loopback"
 	case rtp2.AddressPrivate:
 		return "direct, local network"
-	default:
+	case rtp2.AddressPublic:
 		return "direct, public"
+	case rtp2.AddressShared:
+		return "direct, carrier network"
+	default:
+		// A class this build does not know must not be reported as one it
+		// does. Saying "public" for an unrecognized value is how a path over
+		// a tunnel came to read as a path over the open internet.
+		return fmt.Sprintf("direct, address class %d", uint64(e.AddressClass))
 	}
 }
 
@@ -353,7 +388,11 @@ func report(raw []byte, file string) {
 // changes.
 func fail(err error) {
 	if rtp2.IsRouteRefused(err) {
-		log.Fatalf("refused: the path did not satisfy -route %s", *route)
+		// Name the deadline too. The refusal says nothing about whether the
+		// path was hopeless or merely slower than we were willing to wait,
+		// and that distinction is the first thing anyone asks.
+		log.Fatalf("refused: no path satisfying -route %s appeared within %s (raise -route-grace to wait longer)",
+			*route, graceDescription())
 	}
 	log.Fatal(err)
 }

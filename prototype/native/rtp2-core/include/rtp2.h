@@ -158,7 +158,26 @@ typedef struct rtp2_runtime_config {
      * future ABI moves it to a per-transfer options struct.
      */
     uint32_t route_policy;
-    uint32_t reserved2; /* must be 0 */
+
+    /*
+     * How long, in milliseconds, a path the policy refuses is given to become
+     * one it admits — that is, how long holepunching gets to finish.
+     *
+     * A connection to a peer behind NAT comes up on a relay and upgrades to a
+     * direct path once holepunching completes. Judging it at the first instant
+     * refuses transfers that were about to go direct, so RTP2_ROUTE_DIRECT_ONLY
+     * waits before it refuses.
+     *
+     * 0 selects the default (10s). This field was reserved and required to be
+     * zero in earlier headers, so zero has to keep meaning "whatever the
+     * implementation thinks best" rather than "do not wait" — a caller that
+     * wants no wait at all asks for 1.
+     *
+     * The default is not always enough: between two devices behind carrier
+     * NAT, ten seconds elapsed in full and the transfer was refused. Raise it
+     * when a direct path matters more than failing fast.
+     */
+    uint32_t route_grace_ms;
 } rtp2_runtime_config_t;
 
 /* Runtime: owns the Tokio executor and this device's identity keys. */

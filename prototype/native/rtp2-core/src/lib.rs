@@ -122,8 +122,15 @@ pub struct Rtp2RuntimeConfig {
     /// 0 any, 1 direct-only, 2 loopback-only. Runtime-wide rather than
     /// per-transfer because the ABI has no transfer options struct yet.
     pub route_policy: u32,
-    /// Padding. Must be 0.
-    pub reserved2: u32,
+    /// How long, in milliseconds, a path the policy refuses is given to become
+    /// one it admits — the time holepunching gets to finish. 0 selects
+    /// `route::DEFAULT_ROUTE_GRACE`.
+    ///
+    /// This was a constant in the core until a transfer between two devices
+    /// behind carrier NAT spent the whole of it and was refused. How long to
+    /// wait for a direct path is the same kind of decision as demanding one,
+    /// and belongs to whoever made that demand.
+    pub route_grace_ms: u32,
 }
 
 struct RuntimeState {
@@ -140,6 +147,8 @@ struct RuntimeState {
     key_protection: String,
     /// §16.3.1. Applied to every transfer this runtime drives.
     route_policy: route::RoutePolicy,
+    /// How long holepunching gets before a refused path is refused for good.
+    route_grace: Duration,
     /// On the runtime, not a transfer handle, so freeing a transfer cannot
     /// take its terminal event with it.
     events: events::EventQueue,
@@ -198,6 +207,18 @@ fn into_buffer(mut bytes: Vec<u8>) -> Rtp2Buffer {
     };
     std::mem::forget(bytes);
     out
+}
+
+/// Turns the ABI's milliseconds into a grace period.
+///
+/// Zero keeps the meaning this field had while it was reserved — a caller
+/// built against the previous header zeroed it — so it selects the default
+/// rather than "do not wait". Asking for no wait is expressible as 1 ms.
+fn route_grace_from_config(ms: u32) -> Duration {
+    if ms == 0 {
+        return route::DEFAULT_ROUTE_GRACE;
+    }
+    Duration::from_millis(u64::from(ms))
 }
 
 fn ffi_guard(f: impl FnOnce() -> i32) -> i32 {
@@ -266,12 +287,13 @@ pub extern "C" fn rtp2_runtime_new(config: *const Rtp2RuntimeConfig, out_runtime
 
         // Reserved means reserved. Refusing non-zero now keeps the field
         // usable later without another ABI bump.
-        if config.reserved != 0 || config.reserved2 != 0 {
+        if config.reserved != 0 {
             return ERR_INVALID_ARGUMENT;
         }
         let Some(route_policy) = route::RoutePolicy::from_u64(config.route_policy as u64) else {
             return ERR_INVALID_ARGUMENT;
         };
+        let route_grace = route_grace_from_config(config.route_grace_ms);
 
         let protection = match config.key_protection {
             KEY_PROTECTION_PLAINTEXT => store::Protection::Plaintext,
@@ -361,6 +383,7 @@ pub extern "C" fn rtp2_runtime_new(config: *const Rtp2RuntimeConfig, out_runtime
             store,
             key_protection,
             route_policy,
+            route_grace,
             events: events::EventQueue::new(),
             last_error: Mutex::new(String::new()),
         })));
@@ -709,7 +732,10 @@ pub extern "C" fn rtp2_send_file(
             addr,
             Path::new(path),
             Some(&ep.runtime.events),
-            ep.runtime.route_policy,
+            route::RouteAdmission {
+                policy: ep.runtime.route_policy,
+                grace: ep.runtime.route_grace,
+            },
         ));
         match result {
             Ok(report) => {
@@ -792,7 +818,10 @@ pub extern "C" fn rtp2_receive_file_resumable(
             transfer::ReceiveOptions {
                 resume_state: state.map(Path::new),
                 events: Some(&ep.runtime.events),
-                policy: ep.runtime.route_policy,
+                admission: route::RouteAdmission {
+                    policy: ep.runtime.route_policy,
+                    grace: ep.runtime.route_grace,
+                },
             },
         ));
         match result {
@@ -829,6 +858,28 @@ pub extern "C" fn rtp2_buffer_free(buffer: Rtp2Buffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_configured_route_grace_is_the_one_used() {
+        // Zero is not "no wait": callers compiled against the header where
+        // this field was reserved pass zero, and silently giving them a
+        // zero-length grace period would reintroduce the refusal that judging
+        // a path at the first instant caused.
+        assert_eq!(route_grace_from_config(0), route::DEFAULT_ROUTE_GRACE);
+
+        // Anything else is honoured exactly, including the smallest value —
+        // which is how a caller asks for no wait at all.
+        assert_eq!(route_grace_from_config(1), Duration::from_millis(1));
+        assert_eq!(route_grace_from_config(45_000), Duration::from_secs(45));
+        assert_eq!(
+            route_grace_from_config(u32::MAX),
+            Duration::from_millis(u64::from(u32::MAX))
+        );
+
+        // And a configured value is never silently the default.
+        let default_ms = route::DEFAULT_ROUTE_GRACE.as_millis() as u32;
+        assert_ne!(route_grace_from_config(default_ms + 1), route::DEFAULT_ROUTE_GRACE);
+    }
 
     /// Two endpoints in one process move a file over real QUIC, running the
     /// whole handshake, envelope and Merkle pipeline.

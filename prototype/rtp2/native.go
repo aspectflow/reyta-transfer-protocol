@@ -22,6 +22,8 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"math"
+	"time"
 	"unsafe"
 )
 
@@ -120,6 +122,35 @@ type RuntimeOptions struct {
 	// RoutePolicy restricts which paths transfers may use. The zero value is
 	// RouteAny, which accepts anything and still reports the route.
 	RoutePolicy RoutePolicy
+
+	// RouteGrace is how long a path the policy refuses is given to become one
+	// it admits — the time holepunching gets to finish. The zero value selects
+	// the core's default of 10s.
+	//
+	// Raise it when a direct path matters more than failing fast: between two
+	// devices behind carrier NAT the default elapsed in full and the transfer
+	// was refused. Sub-millisecond values round up to 1ms, which is the way to
+	// ask for no wait at all — zero cannot mean that, because it already means
+	// "use the default".
+	RouteGrace time.Duration
+}
+
+// graceMillis converts a grace period to the ABI's milliseconds, keeping the
+// two edges honest: a negative or zero period means "the default", and any
+// positive period short enough to round to zero becomes 1ms, so asking for a
+// brief wait never turns into asking for the default one.
+func graceMillis(d time.Duration) uint32 {
+	if d <= 0 {
+		return 0
+	}
+	ms := d.Milliseconds()
+	if ms < 1 {
+		return 1
+	}
+	if ms > int64(math.MaxUint32) {
+		return math.MaxUint32
+	}
+	return uint32(ms)
 }
 
 // NewRuntime creates a runtime with an ephemeral device identity.
@@ -136,6 +167,7 @@ func NewRuntimeWithOptions(opts RuntimeOptions) (*Runtime, error) {
 		json_config:    nil,
 		key_protection: C.uint32_t(opts.KeyProtection),
 		route_policy:   C.uint32_t(opts.RoutePolicy),
+		route_grace_ms: C.uint32_t(graceMillis(opts.RouteGrace)),
 	}
 	if opts.StateDir != "" {
 		cStateDir := C.CString(opts.StateDir)

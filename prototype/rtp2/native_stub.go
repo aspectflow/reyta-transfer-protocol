@@ -5,7 +5,10 @@
 
 package rtp2
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 var errCGODisabled = errors.New("rtp2: cgo is disabled; build the Rust core and enable cgo")
 
@@ -44,6 +47,7 @@ type RuntimeOptions struct {
 	KeystoreService string
 	KeystoreAccount string
 	RoutePolicy     RoutePolicy
+	RouteGrace      time.Duration
 }
 
 func NewRuntime() (*Runtime, error)                               { return nil, errCGODisabled }
