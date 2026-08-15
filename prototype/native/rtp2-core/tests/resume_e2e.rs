@@ -20,6 +20,13 @@ use rtp2_core::transfer;
 
 const CHUNK: u64 = 256 * 1024;
 
+/// These tests exercise which chunks a record remembers, not whether bytes
+/// reached the platter — there is no object file behind them to flush.
+async fn no_data_to_flush() -> std::io::Result<()> {
+    Ok(())
+}
+
+
 fn workdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "rtp2-resume-e2e-{}-{}-{tag}",
@@ -82,6 +89,8 @@ async fn attempt(
     received.map_err(|e| e.to_string())
 }
 
+// Builds its own runtime, so it stays a plain test — the awaits inside live in
+// the block_on body.
 #[test]
 fn interrupted_transfer_resumes_from_verified_ranges() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -141,7 +150,7 @@ fn interrupted_transfer_resumes_from_verified_ranges() {
             assert!(!resumed);
             for i in 0..4u64 {
                 db.mark_verified(i).unwrap();
-                db.mark_durable(i).unwrap();
+                db.chunk_written(i, no_data_to_flush).await.unwrap();
             }
             db.checkpoint().unwrap();
             assert_eq!(db.missing_ranges(100), vec![(4, 10)]);
@@ -177,11 +186,12 @@ fn interrupted_transfer_resumes_from_verified_ranges() {
     });
 }
 
-#[test]
-fn resume_record_drives_the_range_request() {
+#[tokio::test]
+async fn resume_record_drives_the_range_request() {
     // Scheduler and resume database must agree on what is missing, since the
     // wire request is built from it.
     use rtp2_core::scheduler::Scheduler;
+
 
     let dir = workdir("ranges");
     let state = dir.join("state");
@@ -200,7 +210,7 @@ fn resume_record_drives_the_range_request() {
     let (mut db, _) = ResumeDb::open(&state, identity.clone(), &data).unwrap();
     for i in [0u64, 1, 2, 3, 10, 11, 19] {
         db.mark_verified(i).unwrap();
-        db.mark_durable(i).unwrap();
+        db.chunk_written(i, no_data_to_flush).await.unwrap();
     }
     db.checkpoint().unwrap();
 
@@ -210,7 +220,7 @@ fn resume_record_drives_the_range_request() {
         identity.chunk_count,
         identity.chunk_ciphertext_size,
     );
-    let request = scheduler.full_request(&db.record().durable).unwrap();
+    let request = scheduler.full_request(&db.record().durable);
     assert_eq!(request.ranges, vec![(4, 10), (12, 19)]);
     request.validate(20).unwrap();
     assert_eq!(request.chunk_total(), 13);
@@ -230,8 +240,8 @@ fn resume_record_drives_the_range_request() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[test]
-fn a_completed_object_asks_for_nothing() {
+#[tokio::test]
+async fn a_completed_object_asks_for_nothing() {
     let dir = workdir("complete");
     let state = dir.join("state");
     let data = dir.join("data");
@@ -248,7 +258,7 @@ fn a_completed_object_asks_for_nothing() {
     let (mut db, _) = ResumeDb::open(&state, identity.clone(), &data).unwrap();
     for i in 0..5u64 {
         db.mark_verified(i).unwrap();
-        db.mark_durable(i).unwrap();
+        db.chunk_written(i, no_data_to_flush).await.unwrap();
     }
     db.checkpoint().unwrap();
 
@@ -258,14 +268,21 @@ fn a_completed_object_asks_for_nothing() {
         5,
         CHUNK + 16,
     );
-    assert!(scheduler.full_request(&db.record().durable).is_none());
+    // A complete object asks for nothing — expressed as a request with no
+    // ranges, which is what the wire format means by it.
+    assert!(
+        scheduler
+            .full_request(&db.record().durable)
+            .ranges
+            .is_empty()
+    );
     assert!(db.is_complete());
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[test]
-fn bitmap_survives_a_restart_with_gaps_intact() {
+#[tokio::test]
+async fn bitmap_survives_a_restart_with_gaps_intact() {
     // What the record exists for: ranges, not a high-water mark.
     let dir = workdir("gaps");
     let state = dir.join("state");
@@ -287,7 +304,7 @@ fn bitmap_survives_a_restart_with_gaps_intact() {
         let (mut db, _) = ResumeDb::open(&state, identity.clone(), &data).unwrap();
         for i in &arrived {
             db.mark_verified(*i).unwrap();
-            db.mark_durable(*i).unwrap();
+            db.chunk_written(*i, no_data_to_flush).await.unwrap();
         }
         db.checkpoint().unwrap();
     }

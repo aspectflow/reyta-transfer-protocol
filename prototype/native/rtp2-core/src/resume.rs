@@ -299,10 +299,53 @@ impl ResumeDb {
         Ok(())
     }
 
-    /// Marks a chunk DURABLE. The caller must already have written and
-    /// flushed the bytes; this does the bitmap commit, batched per
-    /// `checkpoint_interval`.
-    pub fn mark_durable(&mut self, index: u64) -> Result<(), ResumeError> {
+    /// Records that the bytes of chunk `index` have been written to the object
+    /// file, and — when a checkpoint is due — makes them durable and commits
+    /// the bitmap, in that order.
+    ///
+    /// The ordering is the whole point, and it used to live in the caller.
+    /// `sync_data` is how this module reaches the object file it does not own:
+    /// it is called only when a commit is about to happen, and the commit does
+    /// not happen if it fails. A record that survives a crash therefore never
+    /// names a chunk the file does not hold.
+    pub async fn chunk_written<F, Fut>(
+        &mut self,
+        index: u64,
+        sync_data: F,
+    ) -> Result<(), ResumeError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<()>>,
+    {
+        if self
+            .record
+            .durable
+            .set(index)
+            .map_err(|_| ResumeError::Corrupt)?
+        {
+            self.pending += 1;
+        }
+        if self.pending < self.checkpoint_interval {
+            return Ok(());
+        }
+        // Data first. A commit that outran the flush would leave a record
+        // naming chunks the file does not hold, and a resume would skip them.
+        sync_data().await.map_err(io_err)?;
+        self.checkpoint()
+    }
+
+    /// The bitmap half of `chunk_written`, without the flush.
+    ///
+    /// Test-only, and marked so: outside a test there is no correct reason to
+    /// record a chunk as durable without first making it durable.
+    ///
+    /// Private on purpose: reaching this directly is how the ordering came to
+    /// be the caller's problem, and how a record ended up naming chunks that
+    /// were never flushed. Tests that only care about which chunks a record
+    /// remembers use it; anything moving real bytes goes through
+    /// `chunk_written`.
+    #[cfg(test)]
+    fn mark_durable(&mut self, index: u64) -> Result<(), ResumeError> {
         if self
             .record
             .durable
@@ -382,6 +425,94 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The invariant a resume record exists to keep: after a crash, every
+    /// chunk it names must actually be in the file.
+    ///
+    /// This was not held. The fsync lived in the caller, behind
+    /// `durable_count() + DEFAULT_CHECKPOINT_CHUNKS <= have.set_count()` — a
+    /// condition that could never be true, because both counters advanced
+    /// together on every chunk. The bitmap was committed every 64 chunks with
+    /// nothing flushed before it.
+    ///
+    /// The check has to happen *inside* the flush, because that is the only
+    /// moment the two orders differ: a version that commits first has already
+    /// written the claim by the time the data is being flushed. Asserting
+    /// afterwards passes either way — the first attempt at this test did
+    /// exactly that and reported a clean bill of health for the broken order.
+    #[tokio::test]
+    async fn a_committed_record_never_claims_more_than_the_file_holds() {
+        let dir = tempdir("durability-order");
+        let path = dir.join("state");
+        let data = dir.join("data");
+
+        let (mut db, _) = ResumeDb::open(&path, identity(200), &data).unwrap();
+
+        // How many chunks the object file is known to hold.
+        let on_disk = std::rc::Rc::new(std::cell::Cell::new(0u64));
+
+        for i in 0..200u64 {
+            db.mark_verified(i).unwrap();
+
+            let reached = on_disk.clone();
+            let path_in_flush = path.clone();
+            let data_in_flush = data.clone();
+
+            db.chunk_written(i, move || {
+                // Mid-flush: whatever the record on disk claims right now has
+                // to be covered by what was already flushed, because this
+                // flush has not finished yet.
+                let (persisted, _) =
+                    ResumeDb::open(&path_in_flush, identity(200), &data_in_flush).unwrap();
+                assert!(
+                    persisted.durable_count() <= reached.get(),
+                    "the record already claims {} chunks durable while only {} \
+                     had reached the disk — it was committed before the flush",
+                    persisted.durable_count(),
+                    reached.get()
+                );
+                reached.set(i + 1);
+                async { Ok(()) }
+            })
+            .await
+            .unwrap();
+        }
+
+        // And the end state is what it should be.
+        let (persisted, resumed) = ResumeDb::open(&path, identity(200), &data).unwrap();
+        assert!(resumed);
+        assert_eq!(persisted.durable_count(), 192, "four checkpoints of 64");
+    }
+
+    /// A flush that fails must not be followed by a commit. Otherwise the one
+    /// case the ordering exists for — the disk refusing the write — is the one
+    /// case where the record lies about it.
+    #[tokio::test]
+    async fn a_failed_flush_leaves_the_record_where_it_was() {
+        let dir = tempdir("durability-flush-fails");
+        let path = dir.join("state");
+        let data = dir.join("data");
+
+        let (mut db, _) = ResumeDb::open(&path, identity(200), &data).unwrap();
+
+        for i in 0..63u64 {
+            db.chunk_written(i, || async { Ok(()) }).await.unwrap();
+        }
+        // The 64th completes the interval, so this one triggers the flush.
+        let err = db
+            .chunk_written(63, || async {
+                Err(std::io::Error::other("the disk said no"))
+            })
+            .await
+            .expect_err("a failed flush must be reported, not swallowed");
+        assert!(matches!(err, ResumeError::Io(_)), "got {err:?}");
+
+        // Nothing was ever committed, so a resume starts from zero rather than
+        // from a claim the file cannot back.
+        let (persisted, resumed) = ResumeDb::open(&path, identity(200), &data).unwrap();
+        assert!(!resumed, "a record was written despite the flush failing");
+        assert_eq!(persisted.durable_count(), 0);
     }
 
     #[test]
