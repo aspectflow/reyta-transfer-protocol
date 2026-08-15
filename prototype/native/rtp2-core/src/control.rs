@@ -217,6 +217,21 @@ impl ControlChannel {
 
     /// Starts the next send epoch. The peer switches on the first frame it
     /// sees in it.
+    ///
+    /// **Not called by the transfer path, and calling it there would break the
+    /// session.** The epoch belongs to the channel, not to a direction, so this
+    /// advances both: afterwards a frame arriving from the peer in the old
+    /// epoch fails `open` with `StaleEpoch`. In a transfer that is the
+    /// receiver's final acknowledgement, and the transfer would fail after
+    /// every chunk had already arrived.
+    ///
+    /// A rekey therefore has to be negotiated — the REKEY frame in §17.4
+    /// exists for that — and until it is, this is the derivation half of the
+    /// mechanism with the coordination half missing. It is exercised by this
+    /// module's tests and by nothing else.
+    ///
+    /// The threshold is out of reach in the meantime: at 2^32 frames of 256 KiB
+    /// a session would have to carry an exabyte before `rekey_due` fired.
     pub fn begin_next_epoch(&mut self) {
         let next = self.keys.epoch + 1;
         let prk = advance_prk(&self.epoch_prk, next);
@@ -227,6 +242,11 @@ impl ControlChannel {
     }
 
     /// Whether to send REKEY before the counter actually runs out.
+    ///
+    /// Unreachable in a transfer, for the reason given on `begin_next_epoch`.
+    /// Kept because §17.1.2 makes beginning a new epoch before 2^32 a MUST,
+    /// and the arithmetic that decides when should live next to the counter it
+    /// reads, not in whichever caller eventually implements the negotiation.
     pub fn rekey_due(&self) -> bool {
         self.send_counter + 1024 >= MAX_FRAMES_PER_EPOCH
     }
