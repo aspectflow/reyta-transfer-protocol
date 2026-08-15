@@ -115,6 +115,44 @@ impl ObjectContext {
     }
 
     /// Plaintext length of chunk `index` under padding policy NONE.
+    /// Bytes on the wire for one whole chunk: the plaintext plus its AEAD tag.
+    ///
+    /// This lived as an expression in the sender and, inverted, as another in
+    /// the receiver — the two had to agree forever with nothing making them.
+    /// A disagreement is a transfer that negotiates a size the peer computes
+    /// differently, so the relation belongs where the geometry is defined.
+    pub fn chunk_ciphertext_size(&self) -> u64 {
+        self.chunk_plaintext_size as u64 + AEAD_TAG_LEN as u64
+    }
+
+    /// Bytes on the wire for the whole object. Zero chunks carry nothing, not
+    /// even tags.
+    pub fn ciphertext_size(&self) -> u64 {
+        if self.chunk_count == 0 {
+            return 0;
+        }
+        self.encoded_plaintext_size + self.chunk_count * AEAD_TAG_LEN as u64
+    }
+
+    /// Bytes on the wire for the chunk at `index`, which is shorter than the
+    /// rest when it is the last one.
+    pub fn chunk_ciphertext_len(&self, index: u64) -> Result<usize, ObjectError> {
+        Ok(self.chunk_len(index)? as usize + AEAD_TAG_LEN)
+    }
+
+    /// The inverse of [`chunk_ciphertext_size`], for a receiver that has been
+    /// told a chunk size and has to recover the plaintext size behind it.
+    ///
+    /// Refuses anything a chunk of that size could not have produced: a value
+    /// too small to hold a tag, or a plaintext size beyond `u32`.
+    pub fn chunk_plaintext_size_from_ciphertext(ciphertext: u64) -> Result<u32, ObjectError> {
+        ciphertext
+            .checked_sub(AEAD_TAG_LEN as u64)
+            .filter(|v| *v <= u32::MAX as u64)
+            .map(|v| v as u32)
+            .ok_or(ObjectError)
+    }
+
     pub fn chunk_len(&self, index: u64) -> Result<u32, ObjectError> {
         if index >= self.chunk_count {
             return Err(ObjectError);
@@ -223,6 +261,46 @@ pub fn decrypt_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sender writes a chunk size into the manifest and the receiver reads
+    /// it back out. If the two operations are not inverses, the peers disagree
+    /// about the object without either noticing.
+    #[test]
+    fn a_chunk_size_survives_the_round_trip() {
+        for &plaintext in &ALLOWED_CHUNK_SIZES {
+            let ctx = ObjectContext::for_file([0; 32], [1; 32], plaintext as u64 * 4, plaintext)
+                .expect("an allowed chunk size");
+            let on_the_wire = ctx.chunk_ciphertext_size();
+            assert_eq!(
+                ObjectContext::chunk_plaintext_size_from_ciphertext(on_the_wire),
+                Ok(plaintext),
+                "{plaintext} did not survive the round trip"
+            );
+        }
+    }
+
+    /// A size that could not have come from a chunk is refused rather than
+    /// wrapped around into a plausible one.
+    #[test]
+    fn an_impossible_chunk_size_is_refused() {
+        for bad in [0u64, 1, AEAD_TAG_LEN as u64 - 1, u32::MAX as u64 + AEAD_TAG_LEN as u64 + 1] {
+            assert_eq!(
+                ObjectContext::chunk_plaintext_size_from_ciphertext(bad),
+                Err(ObjectError),
+                "{bad} should not describe any chunk"
+            );
+        }
+    }
+
+    /// An object with no chunks carries nothing — not even the tags that a
+    /// naive multiplication would invent.
+    #[test]
+    fn an_empty_object_has_no_ciphertext() {
+        let ctx = ObjectContext::for_file([0; 32], [1; 32], 0, 256 * 1024).unwrap();
+        assert_eq!(ctx.chunk_count, 0);
+        assert_eq!(ctx.ciphertext_size(), 0);
+    }
+
     use crate::keys::FileSecrets;
 
     fn setup(file_size: u64, chunk_size: u32) -> (FileKeySchedule, ObjectContext, [u8; 32]) {
