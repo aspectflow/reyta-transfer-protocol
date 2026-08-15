@@ -147,6 +147,30 @@ MUTATIONS=(
   "route policy admits an unclassified path|src/route.rs|s/                \| \(\n                    RoutePolicy::LoopbackOnly,\n                    Route::Direct\(AddressClass::Loopback\)\n                \)/                | (_, Route::Unknown)\n                | (\n                    RoutePolicy::LoopbackOnly,\n                    Route::Direct(AddressClass::Loopback)\n                )/s"
   "private addresses classified as loopback|src/route.rs|s/                if v4\.is_loopback\(\) \{/                if v4.is_loopback() || v4.is_private() {/s"
   "relay path reported as direct|src/route.rs|s/            iroh::TransportAddr::Relay\(_\) => Route::Relay,/            iroh::TransportAddr::Relay(_) => Route::Unknown,/s"
+  # This one was real, not hypothetical: it is what the first between-device
+  # test hit, and it made a transfer over a tunnel report direct/public.
+  "carrier address reported as public|src/route.rs|s/                \} else if is_shared_address_space\(v4\) \{\n                    AddressClass::Shared\n//s"
+  "shared address range off by one octet|src/route.rs|s/    a == 100 && \(64\.\.=127\)\.contains\(&b\)/    a == 100 \&\& (63..=128).contains(\&b)/s"
+  "route grace never waits for an upgrade|src/transfer.rs|s/    if policy\.admits\(initial\) \{\n        return initial;\n    \}/    return initial;/s"
+  "route grace waits out the full deadline|src/transfer.rs|s/        if policy\.admits\(route\) \{\n            return route;\n        \}\n        last = route;/        last = route;/s"
+  "route grace delays a path it already admits|src/transfer.rs|s/    if policy\.admits\(initial\) \{\n        return initial;\n    \}/    \/\/ mutated/s"
+  "route grace reports the path it started with, not the one it gave up on|src/transfer.rs|s/        last = route;\n    \}\n    last/        last = route;\n    }\n    let _ = last; initial/s"
+  # The route watch. Every entry here is a property the first between-device
+  # test showed we did not actually have.
+  "route switch mid-transfer goes unreported|src/transfer.rs|s/        if route != self\.last \{\n            self\.last = route;/        if false \{\n            self.last = route;/s"
+  "route watch republishes an unchanged path|src/transfer.rs|s/        if route != self\.last \{/        if true \{/s"
+  "policy stops being enforced once bytes flow|src/transfer.rs|s/        if self\.strikes >= ROUTE_WATCH_STRIKES \{\n            return Err\(TransferError::RouteRefused\(route\)\);\n        \}/        \/\/ mutated/s"
+  "one blip tears down a healthy transfer|src/transfer.rs|s/const ROUTE_WATCH_STRIKES: u8 = 2;/const ROUTE_WATCH_STRIKES: u8 = 1;/s"
+  "route strikes never reset after recovery|src/transfer.rs|s/            self\.strikes = 0;\n            return Ok\(\(\)\);/            return Ok(());/s"
+  "route watch looks on every chunk|src/transfer.rs|s/        if now < self\.next_check \{\n            return Ok\(\(\)\);\n        \}/        \/\/ mutated/s"
+  "report names the path the transfer opened on|src/transfer.rs|s/        route: route_watch\.last,/        route,/g"
+  "route grace config ignored|src/lib.rs|s/    Duration::from_millis\(u64::from\(ms\)\)/    route::DEFAULT_ROUTE_GRACE/s"
+  # Durability ordering. The bug these pin was live: the fsync sat behind a
+  # condition in the caller that could never be true.
+  "resume commits the bitmap before the data is flushed|src/resume.rs|s/        sync_data\(\)\.await\.map_err\(io_err\)\?;\n        self\.checkpoint\(\)/        self.checkpoint()?;\n        sync_data().await.map_err(io_err)?;\n        Ok(())/s"
+  "resume commits even when the flush fails|src/resume.rs|s/        sync_data\(\)\.await\.map_err\(io_err\)\?;/        let _ = sync_data().await;/s"
+  "resume never flushes at all|src/resume.rs|s/        sync_data\(\)\.await\.map_err\(io_err\)\?;\n//s"
+  "route grace zero means no wait|src/lib.rs|s/    if ms == 0 \{\n        return route::DEFAULT_ROUTE_GRACE;\n    \}/    \/\/ mutated/s"
   "route checked after the first byte|src/transfer.rs|s/    if !policy\.admits\(route\) \{\n        return Err\(TransferError::RouteRefused\(route\)\);\n    \}/    \/\/ mutated/s"
   "ciphertext cache serves the wrong chunk|src/transfer.rs|s/        self\.entries\.get\(index as usize\)\?\.as_deref\(\)/        let _ = index; self.entries.first()?.as_deref()/s"
   "ciphertext cache budget ignored|src/transfer.rs|s/        if ciphertext\.len\(\) > self\.budget_remaining \{\n            return;\n        \}/        \/\/ mutated/s"

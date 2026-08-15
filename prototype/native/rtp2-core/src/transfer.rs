@@ -34,9 +34,9 @@ use crate::{
     keys::{self, FileSecrets, SealedEnvelope},
     manifest,
     merkle::{self, Direction, ProofStep},
-    object::{self, AEAD_TAG_LEN, ObjectContext},
+    object::{self, ObjectContext},
     offer, resume,
-    route::{Route, RoutePolicy},
+    route::{Route, RouteAdmission, RoutePolicy},
     scheduler::{RangeRequest, Scheduler},
 };
 
@@ -110,8 +110,14 @@ pub struct TransferReport {
     pub chunks_transferred: u64,
     pub peer_device_id: [u8; 32],
     pub peer_endpoint_id: [u8; 32],
-    /// The path the bytes took. Always reported, policy or not: an
-    /// application still has to tell the user where the file went.
+    /// The path the bytes took, as it stood when the transfer finished.
+    /// Always reported, policy or not: an application still has to tell the
+    /// user where the file went.
+    ///
+    /// A connection can start relayed and go direct once holepunching lands,
+    /// so this is the last path observed rather than the first. Every change
+    /// along the way was published as a `TransferRoute` event; an application
+    /// that needs the whole history reads those.
     pub route: Route,
 }
 
@@ -269,13 +275,20 @@ async fn send_frame(
         .seal(frame_type, 0, 0, payload)
         .map_err(|_| TransferError::Crypto("control frame"))?;
     let head = header_bytes(frame_type, 0, 0, sealed.ciphertext.len(), 16)?;
-    let mut meta = [0u8; 16];
-    meta[0..8].copy_from_slice(&sealed.epoch.to_be_bytes());
-    meta[8..16].copy_from_slice(&sealed.counter.to_be_bytes());
 
-    send.write_all(&head).await.map_err(io_err)?;
-    send.write_all(&meta).await.map_err(io_err)?;
-    send.write_all(&sealed.ciphertext).await.map_err(io_err)?;
+    // One write, not three. Each `write_all` takes the connection's lock, and
+    // a profile of a 256 MiB transfer put 71% of the sender's samples waiting
+    // on it — three acquisitions per frame, 3072 for the transfer, to move
+    // bytes that were ready all along. The wire format is unchanged: the same
+    // header, the same 16-byte epoch/counter, the same ciphertext, in the same
+    // order. Only the number of times we ask for the lock changes.
+    let mut frame = Vec::with_capacity(head.len() + 16 + sealed.ciphertext.len());
+    frame.extend_from_slice(&head);
+    frame.extend_from_slice(&sealed.epoch.to_be_bytes());
+    frame.extend_from_slice(&sealed.counter.to_be_bytes());
+    frame.extend_from_slice(&sealed.ciphertext);
+
+    send.write_all(&frame).await.map_err(io_err)?;
     Ok(())
 }
 
@@ -530,7 +543,7 @@ impl PendingTransfer {
     }
 
     pub fn chunk_ciphertext_size(&self) -> u64 {
-        self.ctx.chunk_plaintext_size as u64 + AEAD_TAG_LEN as u64
+        self.ctx.chunk_ciphertext_size()
     }
 
     pub fn logical_plaintext_size(&self) -> u64 {
@@ -555,13 +568,14 @@ fn observe_route(conn: &Connection) -> Route {
 /// Reports the route, then refuses it if policy says so. The event comes
 /// first on purpose: an application that gets refused still needs to know what
 /// it was refused for.
-fn admit_route(
+async fn admit_route(
     conn: &Connection,
     transfer_id: [u8; 32],
-    policy: RoutePolicy,
+    admission: RouteAdmission,
     events: Option<&EventQueue>,
 ) -> Result<Route, TransferError> {
-    let route = observe_route(conn);
+    let route = await_admissible_route(conn, admission, observe_route(conn)).await;
+
     if let Some(q) = events {
         q.push(Event::TransferRoute {
             transfer_id,
@@ -569,10 +583,192 @@ fn admit_route(
             address_class: route.address_class().map(|c| c.as_u64()),
         });
     }
-    if !policy.admits(route) {
+    if !admission.policy.admits(route) {
         return Err(TransferError::RouteRefused(route));
     }
     Ok(route)
+}
+
+/// Keeps the reported route honest for the length of a transfer, and keeps the
+/// policy in force for it.
+///
+/// Admitting the path once, at the start, was wrong twice over. It reported a
+/// route that could stop being true a second later — the first transfer
+/// between two devices behind NAT was reported as relayed, and nothing in the
+/// implementation could say whether it stayed that way. And it enforced a
+/// policy that a connection is free to violate afterwards: a path can fall
+/// back to a relay mid-transfer, which is precisely what `DirectOnly` exists
+/// to prevent, happening at precisely the time nobody was looking.
+struct RouteWatch {
+    last: Route,
+    admission: RouteAdmission,
+    next_check: tokio::time::Instant,
+    /// Consecutive observations the policy refused. A path momentarily has no
+    /// selected candidate — during migration, for one — and reads as
+    /// `Unknown`; tearing a transfer down over that would turn a hiccup into a
+    /// failure. Two in a row is a path that changed, not one in transition.
+    strikes: u8,
+}
+
+/// How often the path is re-examined mid-transfer. Frequent enough that a
+/// switch is reported while it still matters, rare enough to disappear beside
+/// the AEAD work between checks.
+const ROUTE_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Refusals needed before a transfer in flight is torn down.
+const ROUTE_WATCH_STRIKES: u8 = 2;
+
+impl RouteWatch {
+    fn new(initial: Route, admission: RouteAdmission) -> Self {
+        Self {
+            last: initial,
+            admission,
+            next_check: tokio::time::Instant::now() + ROUTE_WATCH_INTERVAL,
+            strikes: 0,
+        }
+    }
+
+    /// Called from the chunk loops. Cheap when it is not yet time to look.
+    fn poll(
+        &mut self,
+        conn: &Connection,
+        transfer_id: [u8; 32],
+        events: Option<&EventQueue>,
+    ) -> Result<(), TransferError> {
+        self.poll_with(transfer_id, events, || observe_route(conn))
+    }
+
+    /// The decision, with the connection replaced by a closure reporting the
+    /// current path — so switching, reporting and the strike count can be
+    /// tested without arranging a real path change on a real network.
+    fn poll_with(
+        &mut self,
+        transfer_id: [u8; 32],
+        events: Option<&EventQueue>,
+        observe: impl FnOnce() -> Route,
+    ) -> Result<(), TransferError> {
+        let now = tokio::time::Instant::now();
+        if now < self.next_check {
+            return Ok(());
+        }
+        self.next_check = now + ROUTE_WATCH_INTERVAL;
+
+        let route = observe();
+        if route != self.last {
+            self.last = route;
+            if let Some(q) = events {
+                q.push(Event::TransferRoute {
+                    transfer_id,
+                    route: route.as_u64(),
+                    address_class: route.address_class().map(|c| c.as_u64()),
+                });
+            }
+        }
+
+        if self.admission.policy.admits(route) {
+            self.strikes = 0;
+            return Ok(());
+        }
+        self.strikes = self.strikes.saturating_add(1);
+        if self.strikes >= ROUTE_WATCH_STRIKES {
+            return Err(TransferError::RouteRefused(route));
+        }
+        Ok(())
+    }
+}
+
+/// Polls the selected path until the policy admits it or the grace period
+/// runs out, returning the last path seen either way.
+///
+/// `Connection::paths_stream` would push these changes instead of polling for
+/// them, but it needs a `Stream` adaptor this crate does not otherwise
+/// depend on, and the wait is seconds long — a 100 ms poll is not the cost
+/// worth adding a dependency to avoid (§28.4).
+async fn await_admissible_route(
+    conn: &Connection,
+    admission: RouteAdmission,
+    initial: Route,
+) -> Route {
+    poll_until_admissible(admission.policy, initial, admission.grace, || {
+        observe_route(conn)
+    })
+    .await
+}
+
+/// The waiting itself, with the connection replaced by a closure that reports
+/// the current path.
+///
+/// Split out because the property worth pinning — waits for an upgrade,
+/// returns the moment one arrives, gives up at the deadline — cannot be tested
+/// through a real [`Connection`]: making one hole-punch on demand inside a unit
+/// test is not something a test can arrange. Against a closure it is three
+/// assertions.
+async fn poll_until_admissible(
+    policy: RoutePolicy,
+    initial: Route,
+    grace: Duration,
+    mut observe: impl FnMut() -> Route,
+) -> Route {
+    // A path the policy already admits costs nothing: no wait, and no change
+    // in behaviour for the common case, which is every connection that is not
+    // behind a NAT still being punched through.
+    if policy.admits(initial) {
+        return initial;
+    }
+
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut last = initial;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let route = observe();
+        if policy.admits(route) {
+            return route;
+        }
+        last = route;
+    }
+    last
+}
+
+/// Reads, encrypts and proves one chunk, returning the frame body ready to
+/// send.
+///
+/// Split out of the send loop so it can be produced while the previous chunk
+/// is on the wire. Everything here is this machine's work and none of it
+/// depends on the transport, which is exactly what makes the overlap sound.
+#[allow(clippy::too_many_arguments)]
+async fn produce_chunk_record(
+    file: &mut tokio::fs::File,
+    buf: &mut [u8],
+    cache: &CiphertextCache,
+    ctx: &object::ObjectContext,
+    ctx_hash: &[u8; 32],
+    schedule: &crate::keys::FileKeySchedule,
+    leaves: &[[u8; 32]],
+    index: u64,
+) -> Result<Vec<u8>, TransferError> {
+    let len = ctx.chunk_len(index).unwrap() as usize;
+
+    // A hit skips the read and the AEAD pass; a miss recomputes the same
+    // bytes. The root built over that ciphertext in `prepare` would catch it
+    // if they ever differed.
+    let recomputed;
+    let ciphertext: &[u8] = match cache.get(index) {
+        Some(bytes) => bytes,
+        None => {
+            file.seek(std::io::SeekFrom::Start(
+                index * ctx.chunk_plaintext_size as u64,
+            ))
+            .await
+            .map_err(io_err)?;
+            file.read_exact(&mut buf[..len]).await.map_err(io_err)?;
+            recomputed = object::encrypt_chunk(schedule, ctx, ctx_hash, index, &buf[..len])
+                .map_err(|_| TransferError::Crypto("chunk encryption"))?;
+            &recomputed
+        }
+    };
+    let proof =
+        merkle::build_proof(leaves, index as usize).map_err(|_| TransferError::Crypto("proof"))?;
+    Ok(encode_chunk_record(index, &proof, ciphertext))
 }
 
 /// Prepares and sends a file in one call.
@@ -582,10 +778,10 @@ pub async fn send_file(
     peer: EndpointAddr,
     path: &Path,
     events: Option<&EventQueue>,
-    policy: RoutePolicy,
+    admission: impl Into<RouteAdmission>,
 ) -> Result<TransferReport, TransferError> {
     let pending = PendingTransfer::prepare(path, DEFAULT_CHUNK_SIZE).await?;
-    send_pending(endpoint, identity, peer, &pending, events, policy).await
+    send_pending(endpoint, identity, peer, &pending, events, admission).await
 }
 
 /// Sends an already-prepared object. Safe to call more than once with the same
@@ -596,8 +792,9 @@ pub async fn send_pending(
     peer: EndpointAddr,
     pending: &PendingTransfer,
     events: Option<&EventQueue>,
-    policy: RoutePolicy,
+    admission: impl Into<RouteAdmission>,
 ) -> Result<TransferReport, TransferError> {
+    let admission = admission.into();
     let path = pending.path.as_path();
     let expected_peer_endpoint: [u8; 32] = *peer.id.as_bytes();
     let local_endpoint_id: [u8; 32] = *endpoint.id().as_bytes();
@@ -609,7 +806,8 @@ pub async fn send_pending(
     }
     // Before any protocol byte leaves. A policy about where data goes is
     // worthless checked after the data went.
-    let route = admit_route(&conn, pending.secrets.transfer_id, policy, events)?;
+    let route = admit_route(&conn, pending.secrets.transfer_id, admission, events).await?;
+    let mut route_watch = RouteWatch::new(route, admission);
     let (mut send, mut recv) = conn.open_bi().await.map_err(io_err)?;
 
     // Standalone handshake (§8.2), initiator side.
@@ -709,11 +907,7 @@ pub async fn send_pending(
     .map_err(|_| TransferError::Crypto("private manifest"))?;
 
     // §13.1 public manifest: transfer mechanics only.
-    let ciphertext_size = if ctx.chunk_count == 0 {
-        0
-    } else {
-        ctx.encoded_plaintext_size + ctx.chunk_count * AEAD_TAG_LEN as u64
-    };
+    let ciphertext_size = ctx.ciphertext_size();
     let public = manifest::PublicManifest {
         protocol_minor: 0,
         suite_id: crate::crypto::SUITE_ID,
@@ -726,7 +920,7 @@ pub async fn send_pending(
             object_role: manifest::ROLE_PRIMARY,
             ciphertext_root,
             ciphertext_size,
-            chunk_ciphertext_size: ctx.chunk_plaintext_size as u64 + AEAD_TAG_LEN as u64,
+            chunk_ciphertext_size: ctx.chunk_ciphertext_size(),
             chunk_count: ctx.chunk_count,
             padding_policy: ctx.padding_policy,
         }],
@@ -783,46 +977,58 @@ pub async fn send_pending(
 
     // Pass 2: only the requested chunks, with proofs. Encryption is
     // deterministic, so a resent chunk matches one the receiver may hold.
-    for &(start, end) in &request.ranges {
-        for index in start..end {
-            let len = ctx.chunk_len(index).unwrap() as usize;
+    //
+    // One chunk ahead of the wire. Reading, encrypting and proving a chunk is
+    // work this machine does; sending it is work the network does, and doing
+    // them in turn means each waits for the other. Between two machines on a
+    // gigabit link that cost 28% of a ceiling the transport was willing to
+    // carry — invisible in-process, where there is no link and both endpoints
+    // share the CPU.
+    let indices: Vec<u64> = request
+        .ranges
+        .iter()
+        .flat_map(|&(start, end)| start..end)
+        .collect();
 
-            // A hit skips the read and the AEAD pass; a miss recomputes the
-            // same bytes. The root built over that ciphertext in `prepare`
-            // would catch it if they ever differed.
-            let cached = cache.get(index);
-            let recomputed;
-            let ciphertext: &[u8] = match cached {
-                Some(bytes) => bytes,
-                None => {
-                    file.seek(std::io::SeekFrom::Start(
-                        index * ctx.chunk_plaintext_size as u64,
-                    ))
-                    .await
-                    .map_err(io_err)?;
-                    file.read_exact(&mut buf[..len]).await.map_err(io_err)?;
-                    recomputed = object::encrypt_chunk(schedule, ctx, ctx_hash, index, &buf[..len])
-                        .map_err(|_| TransferError::Crypto("chunk encryption"))?;
-                    &recomputed
-                }
-            };
-            let proof = merkle::build_proof(leaves, index as usize)
-                .map_err(|_| TransferError::Crypto("proof"))?;
-            let record = encode_chunk_record(index, &proof, ciphertext);
-            send_frame(&mut send, &mut control, FRAME_CHUNK, &record).await?;
+    let mut ahead: Option<Vec<u8>> = match indices.first() {
+        Some(&first) => Some(
+            produce_chunk_record(
+                &mut file, &mut buf, cache, ctx, ctx_hash, schedule, leaves, first,
+            )
+            .await?,
+        ),
+        None => None,
+    };
 
-            sent_bytes += len as u64;
-            sent_chunks += 1;
-            if let Some(q) = events {
-                q.push(Event::TransferProgress {
-                    transfer_id: secrets.transfer_id,
-                    role: ProgressRole::Sending,
-                    bytes: sent_bytes,
-                    total_bytes: ctx.encoded_plaintext_size,
-                    chunks: sent_chunks,
-                    total_chunks: requested_chunks,
-                });
-            }
+    for (position, &index) in indices.iter().enumerate() {
+        let record = ahead.take().expect("a record is always prepared ahead");
+        let len = ctx.chunk_len(index).unwrap() as usize;
+
+        // The overlap itself. `join!` polls both, so while the transport has
+        // the previous chunk the CPU is already producing the next one.
+        send_frame(&mut send, &mut control, FRAME_CHUNK, &record).await?;
+        if let Some(&next) = indices.get(position + 1) {
+            ahead = Some(
+                produce_chunk_record(
+                    &mut file, &mut buf, cache, ctx, ctx_hash, schedule, leaves, next,
+                )
+                .await?,
+            );
+        }
+
+        route_watch.poll(&conn, pending.secrets.transfer_id, events)?;
+
+        sent_bytes += len as u64;
+        sent_chunks += 1;
+        if let Some(q) = events {
+            q.push(Event::TransferProgress {
+                transfer_id: secrets.transfer_id,
+                role: ProgressRole::Sending,
+                bytes: sent_bytes,
+                total_bytes: ctx.encoded_plaintext_size,
+                chunks: sent_chunks,
+                total_chunks: requested_chunks,
+            });
         }
     }
 
@@ -866,7 +1072,7 @@ pub async fn send_pending(
         chunks_transferred: requested_chunks,
         peer_device_id: session.peer.device_id,
         peer_endpoint_id: session.peer_endpoint_id,
-        route,
+        route: route_watch.last,
     })
 }
 
@@ -883,8 +1089,9 @@ pub struct ReceiveOptions<'a> {
     pub resume_state: Option<&'a Path>,
     /// Where §25.3.1 events go. `None` means nobody is listening.
     pub events: Option<&'a EventQueue>,
-    /// Which network paths are acceptable (§16.3.1).
-    pub policy: RoutePolicy,
+    /// Which network paths are acceptable, and how long holepunching gets to
+    /// produce one (§16.3.1).
+    pub admission: RouteAdmission,
 }
 
 pub async fn receive_file(
@@ -898,7 +1105,7 @@ pub async fn receive_file(
     let ReceiveOptions {
         resume_state,
         events,
-        policy,
+        admission,
     } = options;
     let local_endpoint_id: [u8; 32] = *endpoint.id().as_bytes();
 
@@ -910,7 +1117,8 @@ pub async fn receive_file(
     let observed_peer: [u8; 32] = *conn.remote_id().as_bytes();
     // No transfer id yet, so the event names the zero id. The route is what
     // the policy acts on, and refusing before the first stream is the point.
-    let route = admit_route(&conn, [0u8; 32], policy, events)?;
+    let route = admit_route(&conn, [0u8; 32], admission, events).await?;
+    let mut route_watch = RouteWatch::new(route, admission);
     let (mut send, mut recv) = conn.accept_bi().await.map_err(io_err)?;
 
     // Standalone handshake (§8.2), responder side.
@@ -1011,11 +1219,9 @@ pub async fn receive_file(
         return Err(TransferError::Protocol("manifest object mismatch"));
     }
 
-    let chunk_plaintext_size = object_public
-        .chunk_ciphertext_size
-        .checked_sub(AEAD_TAG_LEN as u64)
-        .filter(|v| *v <= u32::MAX as u64)
-        .ok_or(TransferError::Protocol("bad chunk size"))? as u32;
+    let chunk_plaintext_size =
+        ObjectContext::chunk_plaintext_size_from_ciphertext(object_public.chunk_ciphertext_size)
+            .map_err(|_| TransferError::Protocol("bad chunk size"))?;
     let ctx = ObjectContext::for_file(
         opened.secrets.transfer_id,
         opened.secrets.object_id,
@@ -1088,15 +1294,7 @@ pub async fn receive_file(
     );
     // An empty list honestly means nothing is needed: a zero-length object,
     // or one already fully durable.
-    let request = scheduler.full_request(&have).unwrap_or(RangeRequest {
-        transfer_id: opened.secrets.transfer_id,
-        object_id: opened.secrets.object_id,
-        priority_class: 3,
-        ranges: Vec::new(),
-        max_bytes: 0,
-        preferred_chunk_order: 0,
-        durable_ack_generation: 0,
-    });
+    let request = scheduler.full_request(&have);
     send_frame(
         &mut send,
         &mut control,
@@ -1138,7 +1336,9 @@ pub async fn receive_file(
                     // Duplicate delivery of a verified chunk is ignored (§2.7).
                     continue;
                 }
-                let expected_len = ctx.chunk_len(index).unwrap() as usize + AEAD_TAG_LEN;
+                let expected_len = ctx
+                    .chunk_ciphertext_len(index)
+                    .map_err(|_| TransferError::Protocol("chunk index out of range"))?;
                 if ciphertext.len() != expected_len {
                     return Err(TransferError::Protocol("chunk length mismatch"));
                 }
@@ -1163,6 +1363,11 @@ pub async fn receive_file(
                 have.set(index)
                     .map_err(|_| TransferError::Protocol("bitmap"))?;
                 received_this_attempt += 1;
+
+                // The receiver enforces the policy too. Its own transfer_id is
+                // known by now, so a switch is reported against the transfer it
+                // belongs to rather than the zeros used before the handshake.
+                route_watch.poll(&conn, opened.secrets.transfer_id, events)?;
 
                 // Strict order only, after proof and AEAD. A gap abandons the
                 // hash rather than digesting the wrong byte sequence.
@@ -1189,15 +1394,18 @@ pub async fn receive_file(
                     });
                 }
 
-                // Data, flush, then the bitmap commit, which mark_durable
-                // batches.
+                // The record decides when to flush and commit, and in which
+                // order. It used to be decided here, behind a condition that
+                // compared two counters this loop advanced together — so it
+                // was never true, and the bitmap was committed every 64 chunks
+                // with nothing flushed before it.
                 if let Some(db) = db.as_mut() {
-                    if db.durable_count() + resume::DEFAULT_CHECKPOINT_CHUNKS <= have.set_count() {
-                        file.flush().await.map_err(io_err)?;
-                        file.sync_data().await.map_err(io_err)?;
-                    }
-                    db.mark_durable(index)
-                        .map_err(|e| TransferError::Io(e.to_string()))?;
+                    db.chunk_written(index, || async {
+                        file.flush().await?;
+                        file.sync_data().await
+                    })
+                    .await
+                    .map_err(|e| TransferError::Io(e.to_string()))?;
                 }
             }
             FRAME_STREAM_END => break,
@@ -1300,8 +1508,241 @@ pub async fn receive_file(
         chunks_transferred: received_this_attempt,
         peer_device_id: session.peer.device_id,
         peer_endpoint_id: session.peer_endpoint_id,
-        route,
+        route: route_watch.last,
     })
+}
+
+#[cfg(test)]
+mod route_grace_tests {
+    use super::*;
+    use crate::route::{AddressClass, DEFAULT_ROUTE_GRACE};
+    use std::cell::Cell;
+
+    /// Reports `Relay` for the first `upgrade_after` observations and a direct
+    /// public path from then on — a connection that hole-punches successfully,
+    /// as one behind NAT does a moment after it opens.
+    fn upgrading(upgrade_after: usize) -> (impl FnMut() -> Route, std::rc::Rc<Cell<usize>>) {
+        let calls = std::rc::Rc::new(Cell::new(0));
+        let seen = calls.clone();
+        let observe = move || {
+            let n = seen.get();
+            seen.set(n + 1);
+            if n < upgrade_after {
+                Route::Relay
+            } else {
+                Route::Direct(AddressClass::Public)
+            }
+        };
+        (observe, calls)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_path_that_upgrades_is_admitted() {
+        // The bug this exists for: the first real transfer between two devices
+        // was refused because the route was judged at the instant the
+        // connection opened, before holepunching had finished. The refusal
+        // reported our impatience, not the network.
+        let (observe, _) = upgrading(20);
+        let route = poll_until_admissible(
+            RoutePolicy::DirectOnly,
+            Route::Relay,
+            DEFAULT_ROUTE_GRACE,
+            observe,
+        )
+        .await;
+        assert_eq!(route, Route::Direct(AddressClass::Public));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_stops_at_the_upgrade_not_at_the_deadline() {
+        // Returning late is as wrong as refusing early: it would stall every
+        // transfer by the full grace period. The observation count pins that
+        // the loop leaves as soon as the path is admissible.
+        let (observe, calls) = upgrading(3);
+        let started = tokio::time::Instant::now();
+        let route =
+            poll_until_admissible(RoutePolicy::DirectOnly, Route::Relay, DEFAULT_ROUTE_GRACE, observe)
+                .await;
+        assert_eq!(route, Route::Direct(AddressClass::Public));
+        assert_eq!(calls.get(), 4, "polled past the upgrade");
+        assert!(
+            started.elapsed() < DEFAULT_ROUTE_GRACE / 2,
+            "waited {:?}, near the whole grace period",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_path_that_never_upgrades_gives_up_and_reports_what_it_saw() {
+        // Grace is not surrender: a relay-only path must still be refused, and
+        // must be refused as a relay, so the report names the real reason.
+        let started = tokio::time::Instant::now();
+        let route = poll_until_admissible(RoutePolicy::DirectOnly, Route::Unknown, DEFAULT_ROUTE_GRACE, {
+            || Route::Relay
+        })
+        .await;
+        assert_eq!(route, Route::Relay);
+        assert!(!RoutePolicy::DirectOnly.admits(route));
+        assert!(started.elapsed() >= DEFAULT_ROUTE_GRACE, "gave up early");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_admissible_path_is_never_waited_on() {
+        // The common case: a path the policy already accepts must cost nothing
+        // at all — not one sleep, not one extra observation. A grace period
+        // that delayed every transfer would be a worse bug than the one it
+        // was added to fix.
+        let calls = std::rc::Rc::new(Cell::new(0));
+        let seen = calls.clone();
+        let started = tokio::time::Instant::now();
+        let route = poll_until_admissible(RoutePolicy::Any, Route::Relay, DEFAULT_ROUTE_GRACE, move || {
+            seen.set(seen.get() + 1);
+            Route::Relay
+        })
+        .await;
+        assert_eq!(route, Route::Relay);
+        assert_eq!(calls.get(), 0, "observed a path it had already accepted");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod route_watch_tests {
+    use super::*;
+    use crate::route::AddressClass;
+
+    const ID: [u8; 32] = [7u8; 32];
+
+    fn drain(q: &EventQueue) -> Vec<Route> {
+        let mut seen = Vec::new();
+        while let Some(event) = q.poll(Duration::from_millis(0)) {
+            if let Event::TransferRoute { route, .. } = event {
+                seen.push(match route {
+                    0 => Route::Direct(AddressClass::Public),
+                    1 => Route::Relay,
+                    _ => Route::Unknown,
+                });
+            }
+        }
+        seen
+    }
+
+    /// Moves past the next check without waiting for real time.
+    async fn tick() {
+        tokio::time::advance(ROUTE_WATCH_INTERVAL + Duration::from_millis(1)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_upgrade_mid_transfer_is_reported() {
+        // The gap this closes: the first between-device transfer was reported
+        // as relayed, and nothing could say whether it stayed that way for all
+        // 4 MiB. A path that improves has to be published, or the report
+        // describes the first instant and calls it the whole transfer.
+        let q = EventQueue::new();
+        let mut watch = RouteWatch::new(Route::Relay, RouteAdmission::default());
+
+        tick().await;
+        watch
+            .poll_with(ID, Some(&q), || Route::Direct(AddressClass::Public))
+            .expect("Any admits everything");
+
+        assert_eq!(drain(&q), vec![Route::Direct(AddressClass::Public)]);
+        assert_eq!(watch.last, Route::Direct(AddressClass::Public));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_path_says_nothing() {
+        // Publishing the same route every half second would bury the events
+        // that matter under ones that do not.
+        let q = EventQueue::new();
+        let mut watch = RouteWatch::new(Route::Relay, RouteAdmission::default());
+        for _ in 0..4 {
+            tick().await;
+            watch.poll_with(ID, Some(&q), || Route::Relay).unwrap();
+        }
+        assert!(drain(&q).is_empty(), "reported a change that did not happen");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checking_is_free_between_intervals() {
+        // The chunk loops call this per chunk. If it observed every time it
+        // would cost a syscall per chunk for a path that changes rarely.
+        let q = EventQueue::new();
+        let mut watch = RouteWatch::new(Route::Relay, RouteAdmission::default());
+        let mut looks = 0;
+        for _ in 0..50 {
+            watch
+                .poll_with(ID, Some(&q), || {
+                    looks += 1;
+                    Route::Relay
+                })
+                .unwrap();
+        }
+        assert_eq!(looks, 0, "looked before the interval elapsed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_path_that_falls_back_to_a_relay_ends_the_transfer() {
+        // The hole this closes. `DirectOnly` was checked once, at the start,
+        // so a connection that dropped back to a relay afterwards carried the
+        // rest of the ciphertext through exactly the node the caller excluded
+        // — with nothing reported.
+        let q = EventQueue::new();
+        let mut watch = RouteWatch::new(
+            Route::Direct(AddressClass::Public),
+            RouteAdmission::new(RoutePolicy::DirectOnly),
+        );
+
+        tick().await;
+        watch
+            .poll_with(ID, Some(&q), || Route::Relay)
+            .expect("one refused observation is not yet a decision");
+
+        tick().await;
+        let err = watch
+            .poll_with(ID, Some(&q), || Route::Relay)
+            .expect_err("a path that stayed refused must end the transfer");
+        assert!(matches!(err, TransferError::RouteRefused(Route::Relay)));
+
+        // Reported before it was refused, so the application learns why.
+        assert_eq!(drain(&q), vec![Route::Relay]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_momentary_blip_does_not_end_the_transfer() {
+        // A path between candidates has no selected one and reads Unknown.
+        // Tearing down a healthy transfer over a single such reading would
+        // turn a hiccup into a failure.
+        let q = EventQueue::new();
+        let mut watch = RouteWatch::new(
+            Route::Direct(AddressClass::Public),
+            RouteAdmission::new(RoutePolicy::DirectOnly),
+        );
+
+        tick().await;
+        watch.poll_with(ID, Some(&q), || Route::Unknown).unwrap();
+        tick().await;
+        watch
+            .poll_with(ID, Some(&q), || Route::Direct(AddressClass::Public))
+            .expect("recovered before the second strike");
+
+        // And the strike count reset, so the next blip starts from zero
+        // rather than finishing off a transfer that recovered.
+        tick().await;
+        watch
+            .poll_with(ID, Some(&q), || Route::Unknown)
+            .expect("strikes did not reset after recovery");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permissive_policy_never_ends_a_transfer() {
+        let q = EventQueue::new();
+        let mut watch = RouteWatch::new(Route::Direct(AddressClass::Public), RouteAdmission::default());
+        for _ in 0..6 {
+            tick().await;
+            watch.poll_with(ID, Some(&q), || Route::Relay).unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
