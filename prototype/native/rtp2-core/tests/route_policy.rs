@@ -81,7 +81,7 @@ async fn attempt(
         &dst,
         Duration::from_secs(20),
         transfer::ReceiveOptions {
-            policy,
+            admission: policy.into(),
             ..Default::default()
         },
     );

@@ -9,6 +9,20 @@
 //! decision, and the application's to make.
 
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
+
+/// How long a path the policy refuses is given to become one it admits, when
+/// the caller expresses no preference.
+///
+/// A connection to a peer behind NAT starts on a relay and upgrades to a
+/// direct path once holepunching completes, which takes a moment. Ten seconds
+/// is past the point where that either worked or did not on a local network,
+/// and short enough that a genuinely relay-only path fails quickly.
+///
+/// It is only a default. Between two devices behind carrier NAT, ten seconds
+/// was spent in full and the transfer was refused — which is why how long to
+/// wait is the caller's to set, exactly like what to accept.
+pub const DEFAULT_ROUTE_GRACE: Duration = Duration::from_secs(10);
 
 /// How far the bytes travelled on a direct path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +33,18 @@ pub enum AddressClass {
     Private = 1,
     /// A globally routable address.
     Public = 2,
+    /// RFC 6598 shared address space (100.64.0.0/10): the carrier's network.
+    /// Not the local network, and not globally routable either — a mobile
+    /// connection behind carrier-grade NAT lands here, as does a peer reached
+    /// over a tunnel that hands out addresses from this range.
+    ///
+    /// It has its own class because the alternatives both state something
+    /// false. Calling it private claims the bytes stayed on the local network
+    /// when they crossed the carrier's; calling it public claims an address
+    /// that is globally routable when it is not, and that one hid a real
+    /// result: a transfer over a VPN reported `direct/public`, so the report
+    /// could not tell a tunnel from the open internet.
+    Shared = 3,
 }
 
 impl AddressClass {
@@ -39,6 +65,8 @@ impl AddressClass {
                     AddressClass::Loopback
                 } else if v4.is_private() || v4.is_link_local() {
                     AddressClass::Private
+                } else if is_shared_address_space(v4) {
+                    AddressClass::Shared
                 } else {
                     AddressClass::Public
                 }
@@ -58,6 +86,15 @@ impl AddressClass {
     pub fn as_u64(self) -> u64 {
         self as u64
     }
+}
+
+/// Whether `v4` falls in RFC 6598 shared address space, 100.64.0.0/10.
+///
+/// `Ipv4Addr::is_shared` says this in one call but is still unstable, and this
+/// crate builds on stable Rust.
+fn is_shared_address_space(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, _, _] = v4.octets();
+    a == 100 && (64..=127).contains(&b)
 }
 
 /// The path a transfer actually used.
@@ -111,6 +148,7 @@ impl Route {
             Route::Direct(AddressClass::Loopback) => "direct/loopback",
             Route::Direct(AddressClass::Private) => "direct/private",
             Route::Direct(AddressClass::Public) => "direct/public",
+            Route::Direct(AddressClass::Shared) => "direct/shared",
             Route::Relay => "relay",
             Route::Unknown => "unknown",
         }
@@ -165,6 +203,47 @@ impl RoutePolicy {
     }
 }
 
+/// What the application will accept, and how long it will wait to get it.
+///
+/// The two travel together because they are one decision. Demanding a direct
+/// path without saying how long holepunching may take leaves the deadline to
+/// whoever wrote the library, and that deadline is what decides whether the
+/// demand can be met at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteAdmission {
+    pub policy: RoutePolicy,
+    pub grace: Duration,
+}
+
+impl Default for RouteAdmission {
+    fn default() -> Self {
+        Self {
+            policy: RoutePolicy::default(),
+            grace: DEFAULT_ROUTE_GRACE,
+        }
+    }
+}
+
+impl RouteAdmission {
+    /// The default grace period with an explicit policy.
+    pub fn new(policy: RoutePolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_grace(self, grace: Duration) -> Self {
+        Self { grace, ..self }
+    }
+}
+
+impl From<RoutePolicy> for RouteAdmission {
+    fn from(policy: RoutePolicy) -> Self {
+        Self::new(policy)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +290,34 @@ mod tests {
             AddressClass::of(ip("2606:4700::1111")),
             AddressClass::Public
         );
+    }
+
+    #[test]
+    fn shared_address_space_is_neither_private_nor_public() {
+        // 100.64.0.0/10, the range the first real between-device test ran
+        // over. Reported as public, it made a path through a tunnel
+        // indistinguishable from one over the open internet.
+        for addr in ["100.64.0.0", "100.65.252.2", "100.90.160.106", "100.127.255.255"] {
+            assert_eq!(AddressClass::of(ip(addr)), AddressClass::Shared, "{addr}");
+        }
+
+        // The neighbours on either side of the range stay public: 100.63.x and
+        // 100.128.x are ordinary routable space, and an off-by-one in the
+        // second octet would swallow them.
+        for addr in ["100.63.255.255", "100.128.0.0", "99.64.0.1", "101.64.0.1"] {
+            assert_eq!(AddressClass::of(ip(addr)), AddressClass::Public, "{addr}");
+        }
+
+        // A dual-stack socket reports it mapped, like every other v4 address.
+        assert_eq!(
+            AddressClass::of(ip("::ffff:100.65.252.2")),
+            AddressClass::Shared
+        );
+
+        // It is a direct path, so only the loopback policy refuses it.
+        let route = Route::from_socket_addr("100.65.252.2:1234".parse().unwrap());
+        assert!(RoutePolicy::DirectOnly.admits(route));
+        assert!(!RoutePolicy::LoopbackOnly.admits(route));
     }
 
     #[test]
@@ -269,13 +376,15 @@ mod tests {
         let loopback = Route::Direct(AddressClass::Loopback);
         let private = Route::Direct(AddressClass::Private);
         let public = Route::Direct(AddressClass::Public);
+        let shared = Route::Direct(AddressClass::Shared);
 
-        for route in [loopback, private, public] {
+        for route in [loopback, private, public, shared] {
             assert!(RoutePolicy::DirectOnly.admits(route));
         }
         assert!(RoutePolicy::LoopbackOnly.admits(loopback));
         assert!(!RoutePolicy::LoopbackOnly.admits(private));
         assert!(!RoutePolicy::LoopbackOnly.admits(public));
+        assert!(!RoutePolicy::LoopbackOnly.admits(shared));
     }
 
     #[test]
@@ -286,6 +395,7 @@ mod tests {
             Route::Direct(AddressClass::Loopback),
             Route::Direct(AddressClass::Private),
             Route::Direct(AddressClass::Public),
+            Route::Direct(AddressClass::Shared),
             Route::Relay,
             Route::Unknown,
         ];

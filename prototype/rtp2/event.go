@@ -71,6 +71,10 @@ const (
 	AddressLoopback AddressClass = 0
 	AddressPrivate  AddressClass = 1
 	AddressPublic   AddressClass = 2
+	// AddressShared is RFC 6598 space (100.64.0.0/10): the carrier's network,
+	// neither the local one nor globally routable. Carrier-grade NAT and some
+	// tunnels hand out these addresses.
+	AddressShared AddressClass = 3
 )
 
 // Event is one decoded entry from the native event queue. Which fields carry
