@@ -4,6 +4,50 @@ A working prototype of an end-to-end encrypted file transfer protocol for
 moving files between devices, using hybrid post-quantum key exchange and
 hybrid signatures.
 
+## For reviewers: what you are looking at
+
+This repository is one component of a much larger system, opened on its own so
+that the part most worth scrutinising can be read without the rest.
+
+It is published for the **President Tech Award** review. The submission asks for
+a portion of the source; rather than send a fragment, we opened the whole of
+RTP/2 — the protocol, its core implementation and the tools that exercise it.
+A fragment of a security protocol cannot be judged, because the property being
+judged is whether the pieces fit: a key exchange is only as good as the
+transcript that binds it, and a chunk cipher only as good as the proof that
+places the chunk. So the part we made public is the part where being wrong
+matters most, in full, including the gates it has not yet passed.
+
+RTP/2 is the second version of the transfer protocol that moves user data
+between devices in **Reyta**. It is a redesign rather than a revision of the
+first, and what it commits to is easiest to see as a list:
+
+- **Post-quantum from the start, in hybrid form.** Every key exchange runs
+  X25519 and ML-KEM-768 together, every signature Ed25519 and ML-DSA-65. A
+  break of either half alone changes nothing. Data intercepted today and
+  archived is the threat being answered.
+- **The receiver verifies before it trusts.** Every chunk arrives with a Merkle
+  proof against a root the sender signed, so a corrupted or substituted chunk
+  is caught on arrival rather than after the file is assembled.
+- **Metadata is treated as content.** What a relay can see is a design
+  constraint with its own section, not a side effect of the implementation.
+- **The application layer never holds a key.** Every cipher operation, every
+  key and all zeroization live inside the Rust core, behind a C ABI narrow
+  enough that the rest of Reyta cannot mishandle what it never receives.
+
+What is **not** here: Reyta's account system, its clients, its server
+infrastructure and its recovery design. This repository is the protocol, its
+core implementation and the tools that exercise it. Section numbers throughout
+the source (`§8.2.9`, `§16.3.1`) refer to the protocol definition, which is not
+public — the comments are written to be read without it.
+
+Where the code and the definition disagree, the code is the defect. Where the
+definition is silent, the source says so and marks the choice as the
+implementation's rather than the protocol's.
+
+The [Status](#status) section below is the honest state of it, including the
+gates that are not met.
+
 ## Status
 
 This is a prototype. It is not ready for production use and should not be
