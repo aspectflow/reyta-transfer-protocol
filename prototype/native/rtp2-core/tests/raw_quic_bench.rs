@@ -99,3 +99,76 @@ async fn raw_stream_throughput() {
         conn.close(0u32.into(), b"done");
     }
 }
+
+/// Whether one stream is the limit, or the endpoint is.
+///
+/// The end-to-end transfer sits within 2% of a single stream, so no amount of
+/// work on the RTP/2 pipeline can make it faster — the question is whether the
+/// transport itself has anything left. If N concurrent streams move the same
+/// bytes faster than one, splitting an object across streams is worth
+/// building. If they do not, this endpoint is saturated and the ceiling is not
+/// ours to raise.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn concurrent_stream_throughput() {
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let client = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+    let addr = server.addr();
+
+    for &streams in &[1usize, 2, 4, 8] {
+        // Same total bytes every time, so the numbers compare directly.
+        let per_stream = SIZE / streams;
+        let srv = server.clone();
+        let recv_task = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().accept().unwrap().await.unwrap();
+            let mut tasks = Vec::new();
+            for _ in 0..streams {
+                let (_, mut recv) = conn.accept_bi().await.unwrap();
+                tasks.push(tokio::spawn(async move {
+                    let mut total = 0usize;
+                    let mut buf = vec![0u8; 1 << 20];
+                    while let Some(n) = recv.read(&mut buf).await.unwrap() {
+                        total += n;
+                    }
+                    total
+                }));
+            }
+            let mut total = 0usize;
+            for t in tasks {
+                total += t.await.unwrap();
+            }
+            total
+        });
+
+        let start = Instant::now();
+        let conn = client.connect(addr.clone(), ALPN).await.unwrap();
+        let mut senders = Vec::new();
+        for _ in 0..streams {
+            let (mut send, _) = conn.open_bi().await.unwrap();
+            senders.push(tokio::spawn(async move {
+                let payload = vec![7u8; per_stream];
+                for c in payload.chunks(256 * 1024) {
+                    send.write_all(c).await.unwrap();
+                }
+                send.finish().ok();
+            }));
+        }
+        for s in senders {
+            s.await.unwrap();
+        }
+        let total = recv_task.await.unwrap();
+        let secs = start.elapsed().as_secs_f64();
+        assert_eq!(total, per_stream * streams);
+        println!(
+            "  {streams} stream(s){:<8} {:>8.1} MiB/s   ({:.2}s)",
+            "",
+            total as f64 / MIB as f64 / secs,
+            secs
+        );
+        conn.close(0u32.into(), b"done");
+    }
+}
