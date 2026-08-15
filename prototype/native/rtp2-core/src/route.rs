@@ -297,7 +297,12 @@ mod tests {
         // 100.64.0.0/10, the range the first real between-device test ran
         // over. Reported as public, it made a path through a tunnel
         // indistinguishable from one over the open internet.
-        for addr in ["100.64.0.0", "100.65.252.2", "100.90.160.106", "100.127.255.255"] {
+        for addr in [
+            "100.64.0.0",
+            "100.65.252.2",
+            "100.90.160.106",
+            "100.127.255.255",
+        ] {
             assert_eq!(AddressClass::of(ip(addr)), AddressClass::Shared, "{addr}");
         }
 

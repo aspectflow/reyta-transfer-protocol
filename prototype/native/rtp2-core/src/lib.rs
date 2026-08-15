@@ -878,7 +878,10 @@ mod tests {
 
         // And a configured value is never silently the default.
         let default_ms = route::DEFAULT_ROUTE_GRACE.as_millis() as u32;
-        assert_ne!(route_grace_from_config(default_ms + 1), route::DEFAULT_ROUTE_GRACE);
+        assert_ne!(
+            route_grace_from_config(default_ms + 1),
+            route::DEFAULT_ROUTE_GRACE
+        );
     }
 
     /// Two endpoints in one process move a file over real QUIC, running the

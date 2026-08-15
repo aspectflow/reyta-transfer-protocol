@@ -283,7 +283,12 @@ mod tests {
     /// wrapped around into a plausible one.
     #[test]
     fn an_impossible_chunk_size_is_refused() {
-        for bad in [0u64, 1, AEAD_TAG_LEN as u64 - 1, u32::MAX as u64 + AEAD_TAG_LEN as u64 + 1] {
+        for bad in [
+            0u64,
+            1,
+            AEAD_TAG_LEN as u64 - 1,
+            u32::MAX as u64 + AEAD_TAG_LEN as u64 + 1,
+        ] {
             assert_eq!(
                 ObjectContext::chunk_plaintext_size_from_ciphertext(bad),
                 Err(ObjectError),

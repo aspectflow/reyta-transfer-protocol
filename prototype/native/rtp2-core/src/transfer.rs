@@ -1560,9 +1560,13 @@ mod route_grace_tests {
         // the loop leaves as soon as the path is admissible.
         let (observe, calls) = upgrading(3);
         let started = tokio::time::Instant::now();
-        let route =
-            poll_until_admissible(RoutePolicy::DirectOnly, Route::Relay, DEFAULT_ROUTE_GRACE, observe)
-                .await;
+        let route = poll_until_admissible(
+            RoutePolicy::DirectOnly,
+            Route::Relay,
+            DEFAULT_ROUTE_GRACE,
+            observe,
+        )
+        .await;
         assert_eq!(route, Route::Direct(AddressClass::Public));
         assert_eq!(calls.get(), 4, "polled past the upgrade");
         assert!(
@@ -1577,9 +1581,12 @@ mod route_grace_tests {
         // Grace is not surrender: a relay-only path must still be refused, and
         // must be refused as a relay, so the report names the real reason.
         let started = tokio::time::Instant::now();
-        let route = poll_until_admissible(RoutePolicy::DirectOnly, Route::Unknown, DEFAULT_ROUTE_GRACE, {
-            || Route::Relay
-        })
+        let route = poll_until_admissible(
+            RoutePolicy::DirectOnly,
+            Route::Unknown,
+            DEFAULT_ROUTE_GRACE,
+            || Route::Relay,
+        )
         .await;
         assert_eq!(route, Route::Relay);
         assert!(!RoutePolicy::DirectOnly.admits(route));
@@ -1595,10 +1602,15 @@ mod route_grace_tests {
         let calls = std::rc::Rc::new(Cell::new(0));
         let seen = calls.clone();
         let started = tokio::time::Instant::now();
-        let route = poll_until_admissible(RoutePolicy::Any, Route::Relay, DEFAULT_ROUTE_GRACE, move || {
-            seen.set(seen.get() + 1);
-            Route::Relay
-        })
+        let route = poll_until_admissible(
+            RoutePolicy::Any,
+            Route::Relay,
+            DEFAULT_ROUTE_GRACE,
+            move || {
+                seen.set(seen.get() + 1);
+                Route::Relay
+            },
+        )
         .await;
         assert_eq!(route, Route::Relay);
         assert_eq!(calls.get(), 0, "observed a path it had already accepted");
@@ -1660,7 +1672,10 @@ mod route_watch_tests {
             tick().await;
             watch.poll_with(ID, Some(&q), || Route::Relay).unwrap();
         }
-        assert!(drain(&q).is_empty(), "reported a change that did not happen");
+        assert!(
+            drain(&q).is_empty(),
+            "reported a change that did not happen"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1737,7 +1752,10 @@ mod route_watch_tests {
     #[tokio::test(start_paused = true)]
     async fn a_permissive_policy_never_ends_a_transfer() {
         let q = EventQueue::new();
-        let mut watch = RouteWatch::new(Route::Direct(AddressClass::Public), RouteAdmission::default());
+        let mut watch = RouteWatch::new(
+            Route::Direct(AddressClass::Public),
+            RouteAdmission::default(),
+        );
         for _ in 0..6 {
             tick().await;
             watch.poll_with(ID, Some(&q), || Route::Relay).unwrap();

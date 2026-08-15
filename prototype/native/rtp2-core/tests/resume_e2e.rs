@@ -26,7 +26,6 @@ async fn no_data_to_flush() -> std::io::Result<()> {
     Ok(())
 }
 
-
 fn workdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "rtp2-resume-e2e-{}-{}-{tag}",
@@ -191,7 +190,6 @@ async fn resume_record_drives_the_range_request() {
     // Scheduler and resume database must agree on what is missing, since the
     // wire request is built from it.
     use rtp2_core::scheduler::Scheduler;
-
 
     let dir = workdir("ranges");
     let state = dir.join("state");
